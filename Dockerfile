@@ -19,6 +19,7 @@ ENV VLLM_BASE_DIR=/workspace/vllm
 RUN apt update && apt upgrade -y \
     && apt install -y --allow-change-held-packages --no-install-recommends \
     curl vim cmake build-essential ninja-build \
+    libcudnn9-cuda-13 libcudnn9-dev-cuda-13 \
     python3-dev python3-pip git wget \
     libnccl-dev libnccl2 libibverbs1 libibverbs-dev rdma-core \
     ccache \
@@ -165,7 +166,8 @@ ENV PIP_CACHE_DIR=/root/.cache/pip
 RUN apt update && apt upgrade -y \
     && apt install -y --allow-change-held-packages --no-install-recommends \
     python3 python3-pip python3-dev vim curl git wget \
-    libnccl-dev libnccl2 libibverbs1 rdma-core \
+    libcudnn9-cuda-13 \
+    libnccl-dev libnccl2 libibverbs1 libibverbs-dev rdma-core \
     && rm -rf /var/lib/apt/lists/*
 
 # Set final working directory
