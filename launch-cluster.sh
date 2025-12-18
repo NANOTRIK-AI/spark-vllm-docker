@@ -3,24 +3,27 @@
 # Default Configuration
 IMAGE_NAME="vllm-node"
 DEFAULT_CONTAINER_NAME="vllm_node"
-ETH_IF="enp1s0f1np1"
-IB_IF="rocep1s0f1,roceP2p1s0f1"
+# ETH_IF and IB_IF will be auto-detected if not provided
+ETH_IF=""
+IB_IF=""
 
 # Initialize variables
 NODES_ARG=""
 CONTAINER_NAME="$DEFAULT_CONTAINER_NAME"
 COMMAND_TO_RUN=""
 DAEMON_MODE="false"
+CHECK_CONFIG="false"
 ACTION="start"
 
 # Function to print usage
 usage() {
-    echo "Usage: $0 -n <node_ips> [-t <image_name>] [--name <container_name>] [--eth-if <if_name>] [--ib-if <if_name>] [-d] [action] [command]"
-    echo "  -n, --nodes     Comma-separated list of node IPs (Mandatory)"
+    echo "Usage: $0 [-n <node_ips>] [-t <image_name>] [--name <container_name>] [--eth-if <if_name>] [--ib-if <if_name>] [--check-config] [-d] [action] [command]"
+    echo "  -n, --nodes     Comma-separated list of node IPs (Optional, auto-detected if omitted)"
     echo "  -t              Docker image name (Optional, default: $IMAGE_NAME)"
     echo "  --name          Container name (Optional, default: $DEFAULT_CONTAINER_NAME)"
-    echo "  --eth-if        Ethernet interface (Optional, default: $ETH_IF)"
-    echo "  --ib-if         InfiniBand interface (Optional, default: $IB_IF)"
+    echo "  --eth-if        Ethernet interface (Optional, auto-detected)"
+    echo "  --ib-if         InfiniBand interface (Optional, auto-detected)"
+    echo "  --check-config  Check configuration and auto-detection without launching"
     echo "  -d              Daemon mode (only for 'start' action)"
     echo "  action          start | stop | status | exec (Default: start)"
     echo "  command         Command to run (only for 'exec' action)"
@@ -35,6 +38,7 @@ while [[ "$#" -gt 0 ]]; do
         --name) CONTAINER_NAME="$2"; shift ;;
         --eth-if) ETH_IF="$2"; shift ;;
         --ib-if) IB_IF="$2"; shift ;;
+        --check-config) CHECK_CONFIG="true" ;;
         -d) DAEMON_MODE="true" ;;
         -h|--help) usage ;;
         start|stop|status) 
@@ -59,8 +63,135 @@ while [[ "$#" -gt 0 ]]; do
     shift
 done
 
+# --- Auto-Detection Logic ---
+
+# Check for required tools if auto-detection is needed
+if [[ -z "$ETH_IF" || -z "$IB_IF" || -z "$NODES_ARG" ]]; then
+    if ! command -v ibdev2netdev &> /dev/null; then
+        echo "Error: ibdev2netdev not found. Cannot auto-detect interfaces."
+        exit 1
+    fi
+fi
+
+# 1. Detect Interfaces (ETH_IF and IB_IF)
+if [[ -z "$ETH_IF" || -z "$IB_IF" ]]; then
+    echo "Auto-detecting interfaces..."
+    
+    # Get all Up interfaces: "mlx5_0 port 1 ==> enp1s0f0np0 (Up)"
+    # We capture: IB_DEV, NET_DEV
+    mapfile -t IB_NET_PAIRS < <(ibdev2netdev | awk '/Up\)/ {print $1 " " $5}')
+    
+    if [ ${#IB_NET_PAIRS[@]} -eq 0 ]; then
+        echo "Error: No active IB interfaces found."
+        exit 1
+    fi
+
+    DETECTED_IB_IFS=()
+    CANDIDATE_ETH_IFS=()
+
+    for pair in "${IB_NET_PAIRS[@]}"; do
+        ib_dev=$(echo "$pair" | awk '{print $1}')
+        net_dev=$(echo "$pair" | awk '{print $2}')
+        
+        DETECTED_IB_IFS+=("$ib_dev")
+        
+        # Check if interface has an IP address
+        if ip addr show "$net_dev" | grep -q "inet "; then
+            CANDIDATE_ETH_IFS+=("$net_dev")
+        fi
+    done
+
+    # Set IB_IF if not provided
+    if [[ -z "$IB_IF" ]]; then
+        IB_IF=$(IFS=,; echo "${DETECTED_IB_IFS[*]}")
+        echo "  Detected IB_IF: $IB_IF"
+    fi
+
+    # Set ETH_IF if not provided
+    if [[ -z "$ETH_IF" ]]; then
+        if [ ${#CANDIDATE_ETH_IFS[@]} -eq 0 ]; then
+            echo "Error: No active IB-associated interfaces have IP addresses."
+            exit 1
+        fi
+        
+        # Selection logic: Prefer interface without capital 'P'
+        SELECTED_ETH=""
+        for iface in "${CANDIDATE_ETH_IFS[@]}"; do
+            if [[ "$iface" != *"P"* ]]; then
+                SELECTED_ETH="$iface"
+                break
+            fi
+        done
+        
+        # Fallback: Use the first one if all have 'P' or none found yet
+        if [[ -z "$SELECTED_ETH" ]]; then
+            SELECTED_ETH="${CANDIDATE_ETH_IFS[0]}"
+        fi
+        
+        ETH_IF="$SELECTED_ETH"
+        echo "  Detected ETH_IF: $ETH_IF"
+    fi
+fi
+
+# 2. Detect Nodes if not provided
 if [[ -z "$NODES_ARG" ]]; then
-    echo "Error: Nodes argument (-n) is mandatory."
+    echo "Auto-detecting nodes..."
+    
+    if ! command -v avahi-browse &> /dev/null; then
+        echo "Error: avahi-browse not found. Please install avahi-utils."
+        exit 1
+    fi
+
+    # Get local IP of the selected ETH_IF
+    LOCAL_IP=$(ip -4 addr show "$ETH_IF" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
+    if [[ -z "$LOCAL_IP" ]]; then
+        echo "Error: Could not determine IP for interface $ETH_IF"
+        exit 1
+    fi
+    
+    echo "  Detected Local IP: $LOCAL_IP"
+
+    DETECTED_IPS=("$LOCAL_IP")
+    
+    # Scan for other nodes
+    echo "  Scanning for peers via avahi..."
+    # Run avahi-browse, filter for _ssh._tcp, and look for our interface
+    # Note: avahi-browse output format varies, we use -p (parsable)
+    # Format: =;interface;IPv4;name;type;domain;hostname;ip;port;txt
+    
+    # We only care about services on our selected ETH_IF or related interfaces?
+    # The reference script scans ALL interfaces found by ibdev2netdev.
+    # Let's stick to the reference logic: scan on all IB-associated interfaces.
+    
+    TEMP_FILE=$(mktemp)
+    trap 'rm -f "$TEMP_FILE"' EXIT
+    
+    avahi_output=$(avahi-browse -p -r -f -t _ssh._tcp 2>/dev/null)
+    
+    # Filter by the selected management interface (ETH_IF)
+    echo "$avahi_output" | grep ";$ETH_IF;" > "$TEMP_FILE"
+       
+    # Extract IPs
+    while IFS=';' read -r prefix iface protocol name type domain hostname ip port txt; do
+        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+             # Avoid duplicates
+             if [[ ! " ${DETECTED_IPS[@]} " =~ " ${ip} " ]]; then
+                 DETECTED_IPS+=("$ip")
+                 echo "  Found peer: $ip ($hostname)"
+             fi
+        fi
+    done < <(grep "^=" "$TEMP_FILE" | grep "IPv4")
+    
+    # Sort IPs
+    IFS=$'\n' SORTED_IPS=($(sort <<<"${DETECTED_IPS[*]}"))
+    unset IFS
+    
+    NODES_ARG=$(IFS=,; echo "${SORTED_IPS[*]}")
+    echo "  Cluster Nodes: $NODES_ARG"
+fi
+
+if [[ -z "$NODES_ARG" ]]; then
+    echo "Error: Nodes argument (-n) is mandatory or could not be auto-detected."
     usage
 fi
 
@@ -98,8 +229,19 @@ echo "Worker Nodes: ${WORKER_NODES[*]}"
 echo "Container Name: $CONTAINER_NAME"
 echo "Action: $ACTION"
 
+if [[ "$CHECK_CONFIG" == "true" ]]; then
+    echo "Configuration Check Complete."
+    echo "  Image Name: $IMAGE_NAME"
+    echo "  ETH Interface: $ETH_IF"
+    echo "  IB Interface: $IB_IF"
+    exit 0
+fi
+
 # Cleanup Function
 cleanup() {
+    # Remove traps to prevent nested cleanup
+    trap - EXIT INT TERM HUP
+
     echo ""
     echo "Stopping cluster..."
     
