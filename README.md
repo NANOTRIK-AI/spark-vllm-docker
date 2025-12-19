@@ -246,6 +246,7 @@ You can override the auto-detected values if needed:
 | `--name` | Container name (default: `vllm_node`). |
 | `--eth-if` | Ethernet interface name. |
 | `--ib-if` | InfiniBand interface name. |
+| `--nccl-debug` | NCCL debug level (e.g., INFO, WARN). Defaults to INFO if flag is present but value is omitted. |
 | `--check-config` | Check configuration and auto-detection without launching. |
 | `-d` | Run in daemon mode (detached). |
 

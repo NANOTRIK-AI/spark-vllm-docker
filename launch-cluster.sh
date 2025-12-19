@@ -4,7 +4,7 @@
 IMAGE_NAME="vllm-node"
 DEFAULT_CONTAINER_NAME="vllm_node"
 # Modify these if you want to pass additional docker args or set VLLM_SPARK_EXTRA_DOCKER_ARGS variable
-DOCKER_ARGS="-e NCCL_DEBUG=INFO -e NCCL_IGNORE_CPU_AFFINITY=1 -v $HOME/.cache/huggingface:/root/.cache/huggingface"
+DOCKER_ARGS="-e NCCL_IGNORE_CPU_AFFINITY=1 -v $HOME/.cache/huggingface:/root/.cache/huggingface"
 
 # Append additional arguments from environment variable
 if [[ -n "$VLLM_SPARK_EXTRA_DOCKER_ARGS" ]]; then
@@ -14,6 +14,7 @@ fi
 # ETH_IF and IB_IF will be auto-detected if not provided
 ETH_IF=""
 IB_IF=""
+NCCL_DEBUG_VAL=""
 
 # Initialize variables
 NODES_ARG=""
@@ -26,12 +27,13 @@ CLUSTER_WAS_RUNNING="false"
 
 # Function to print usage
 usage() {
-    echo "Usage: $0 [-n <node_ips>] [-t <image_name>] [--name <container_name>] [--eth-if <if_name>] [--ib-if <if_name>] [--check-config] [-d] [action] [command]"
+    echo "Usage: $0 [-n <node_ips>] [-t <image_name>] [--name <container_name>] [--eth-if <if_name>] [--ib-if <if_name>] [--nccl-debug <level>] [--check-config] [-d] [action] [command]"
     echo "  -n, --nodes     Comma-separated list of node IPs (Optional, auto-detected if omitted)"
     echo "  -t              Docker image name (Optional, default: $IMAGE_NAME)"
     echo "  --name          Container name (Optional, default: $DEFAULT_CONTAINER_NAME)"
     echo "  --eth-if        Ethernet interface (Optional, auto-detected)"
     echo "  --ib-if         InfiniBand interface (Optional, auto-detected)"
+    echo "  --nccl-debug    NCCL debug level (Optional, one of: VERSION, WARN, INFO, TRACE). If no level is provided, defaults to INFO."
     echo "  --check-config  Check configuration and auto-detection without launching"
     echo "  -d              Daemon mode (only for 'start' action)"
     echo "  action          start | stop | status | exec (Default: start)"
@@ -47,6 +49,14 @@ while [[ "$#" -gt 0 ]]; do
         --name) CONTAINER_NAME="$2"; shift ;;
         --eth-if) ETH_IF="$2"; shift ;;
         --ib-if) IB_IF="$2"; shift ;;
+        --nccl-debug)
+            if [[ -n "$2" && "$2" =~ ^(VERSION|WARN|INFO|TRACE)$ ]]; then
+                NCCL_DEBUG_VAL="$2"
+                shift
+            else
+                NCCL_DEBUG_VAL="INFO"
+            fi
+            ;;
         --check-config) CHECK_CONFIG="true" ;;
         -d) DAEMON_MODE="true" ;;
         -h|--help) usage ;;
@@ -71,6 +81,20 @@ while [[ "$#" -gt 0 ]]; do
     esac
     shift
 done
+
+# Append NCCL_DEBUG if set, with validation
+if [[ -n "$NCCL_DEBUG_VAL" ]]; then
+    case "$NCCL_DEBUG_VAL" in
+        VERSION|WARN|INFO|TRACE)
+            DOCKER_ARGS="$DOCKER_ARGS -e NCCL_DEBUG=$NCCL_DEBUG_VAL"
+            ;;
+        *)
+            echo "Error: Invalid value for --nccl-debug: $NCCL_DEBUG_VAL"
+            echo "Allowed values: VERSION, WARN, INFO, TRACE"
+            exit 1
+            ;;
+    esac
+fi
 
 # --- Auto-Detection Logic ---
 
