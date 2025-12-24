@@ -24,8 +24,8 @@ DAEMON_MODE="false"
 CHECK_CONFIG="false"
 ACTION="start"
 CLUSTER_WAS_RUNNING="false"
-MOD_PATH=""
-MOD_TYPE=""
+MOD_PATHS=()
+MOD_TYPES=()
 
 # Function to print usage
 usage() {
@@ -36,7 +36,7 @@ usage() {
     echo "  --eth-if        Ethernet interface (Optional, auto-detected)"
     echo "  --ib-if         InfiniBand interface (Optional, auto-detected)"
     echo "  --nccl-debug    NCCL debug level (Optional, one of: VERSION, WARN, INFO, TRACE). If no level is provided, defaults to INFO."
-    echo "  --apply-mod     Path to directory or zip file containing run.sh to apply before launch"
+    echo "  --apply-mod     Path to directory or zip file containing run.sh to apply before launch (Can be specified multiple times)"
     echo "  --check-config  Check configuration and auto-detection without launching"
     echo "  -d              Daemon mode (only for 'start' action)"
     echo "  action          start | stop | status | exec (Default: start)"
@@ -52,7 +52,7 @@ while [[ "$#" -gt 0 ]]; do
         --name) CONTAINER_NAME="$2"; shift ;;
         --eth-if) ETH_IF="$2"; shift ;;
         --ib-if) IB_IF="$2"; shift ;;
-        --apply-mod) MOD_PATH="$2"; shift ;;
+        --apply-mod) MOD_PATHS+=("$2"); shift ;;
         --nccl-debug)
             if [[ -n "$2" && "$2" =~ ^(VERSION|WARN|INFO|TRACE)$ ]]; then
                 NCCL_DEBUG_VAL="$2"
@@ -100,40 +100,41 @@ if [[ -n "$NCCL_DEBUG_VAL" ]]; then
     esac
 fi
 
-# Validate MOD_PATH if set
-if [[ -n "$MOD_PATH" ]]; then
-    if [[ ! -e "$MOD_PATH" ]]; then
-        echo "Error: Mod path '$MOD_PATH' does not exist."
+# Validate MOD_PATHS if set
+for i in "${!MOD_PATHS[@]}"; do
+    mod_path="${MOD_PATHS[$i]}"
+    if [[ ! -e "$mod_path" ]]; then
+        echo "Error: Mod path '$mod_path' does not exist."
         exit 1
     fi
     
-    if [[ -d "$MOD_PATH" ]]; then
-        if [[ ! -f "$MOD_PATH/run.sh" ]]; then
-             echo "Error: Mod directory must contain 'run.sh'."
+    if [[ -d "$mod_path" ]]; then
+        if [[ ! -f "$mod_path/run.sh" ]]; then
+             echo "Error: Mod directory '$mod_path' must contain 'run.sh'."
              exit 1
         fi
-        MOD_TYPE="dir"
-    elif [[ -f "$MOD_PATH" && "$MOD_PATH" == *.zip ]]; then
+        MOD_TYPES[$i]="dir"
+    elif [[ -f "$mod_path" && "$mod_path" == *.zip ]]; then
         # Check zip content using unzip if available, else python
         if command -v unzip &> /dev/null; then
-            if ! unzip -l "$MOD_PATH" | grep -q "run.sh"; then
-                 echo "Error: Mod zip file must contain 'run.sh'."
+            if ! unzip -l "$mod_path" | grep -q "run.sh"; then
+                 echo "Error: Mod zip file '$mod_path' must contain 'run.sh'."
                  exit 1
             fi
         else
              # Fallback to python for checking zip content
-             if ! python3 -c "import zipfile, sys; sys.exit(0 if 'run.sh' in zipfile.ZipFile(sys.argv[1]).namelist() else 1)" "$MOD_PATH"; then
-                 echo "Error: Mod zip file must contain 'run.sh'."
+             if ! python3 -c "import zipfile, sys; sys.exit(0 if 'run.sh' in zipfile.ZipFile(sys.argv[1]).namelist() else 1)" "$mod_path"; then
+                 echo "Error: Mod zip file '$mod_path' must contain 'run.sh'."
                  exit 1
              fi
         fi
-        MOD_TYPE="zip"
+        MOD_TYPES[$i]="zip"
     else
-        echo "Error: --apply-mod must be a directory or a .zip file."
+        echo "Error: --apply-mod '$mod_path' must be a directory or a .zip file."
         exit 1
     fi
-    MOD_PATH=$(realpath "$MOD_PATH")
-fi
+    MOD_PATHS[$i]=$(realpath "$mod_path")
+done
 
 # --- Auto-Detection Logic ---
 
@@ -293,9 +294,11 @@ apply_mod_to_container() {
     local node_ip="$1"
     local container="$2"
     local is_local="$3" # true/false
+    local mod_path="$4"
+    local mod_type="$5"
 
-    local mod_name=$(basename "$MOD_PATH")
-    if [[ "$MOD_TYPE" == "zip" ]]; then
+    local mod_name=$(basename "$mod_path")
+    if [[ "$mod_type" == "zip" ]]; then
         mod_name="${mod_name%.*}"
     fi
 
@@ -303,23 +306,34 @@ apply_mod_to_container() {
 
     # 1. Copy mod to node (if remote)
     local target_mod_path=""
+    local remote_cleanup_path=""
+
     if [[ "$is_local" == "true" ]]; then
-        target_mod_path="$MOD_PATH"
+        target_mod_path="$mod_path"
     else
         # SCP to remote
-        local remote_tmp="/tmp/vllm_mod_pkg_$(date +%s)"
+        local remote_tmp="/tmp/vllm_mod_pkg_$(date +%s)_$RANDOM"
         echo "  Copying mod package to $node_ip:$remote_tmp..."
         
         # Create directory first to ensure consistent path structure
         ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$node_ip" "mkdir -p $remote_tmp"
+        remote_cleanup_path="$remote_tmp"
         
-        # Copy contents using wildcard to avoid creating a subdirectory
-        # Note: We use scp -r with wildcard to copy contents into the pre-created dir
-        if ! scp -r -o BatchMode=yes -o StrictHostKeyChecking=no "$MOD_PATH"/* "$node_ip:$remote_tmp/"; then
-            echo "Error: Failed to copy mod to $node_ip"
-            exit 1
+        if [[ "$mod_type" == "zip" ]]; then
+             if ! scp -o BatchMode=yes -o StrictHostKeyChecking=no "$mod_path" "$node_ip:$remote_tmp/"; then
+                echo "Error: Failed to copy mod to $node_ip"
+                exit 1
+             fi
+             target_mod_path="$remote_tmp/$(basename "$mod_path")"
+        else
+             # Directory
+             # Copy contents using wildcard to avoid creating a subdirectory
+             if ! scp -r -o BatchMode=yes -o StrictHostKeyChecking=no "$mod_path"/* "$node_ip:$remote_tmp/"; then
+                echo "Error: Failed to copy mod to $node_ip"
+                exit 1
+             fi
+             target_mod_path="$remote_tmp"
         fi
-        target_mod_path="$remote_tmp"
     fi
 
     # 2. Copy into container
@@ -334,8 +348,8 @@ apply_mod_to_container() {
     # Create workspace in container
     $cmd_prefix docker exec "$container" mkdir -p "$container_dest"
 
-    if [[ "$MOD_TYPE" == "zip" ]]; then
-        local zip_name=$(basename "$MOD_PATH")
+    if [[ "$mod_type" == "zip" ]]; then
+        local zip_name=$(basename "$mod_path")
         echo "  Copying zip to container..."
         $cmd_prefix docker cp "$target_mod_path" "$container:$container_dest/$zip_name"
         
@@ -351,7 +365,7 @@ apply_mod_to_container() {
         # Directory
         echo "  Copying directory content to container..."
         if [[ "$is_local" == "true" ]]; then
-             docker cp "$MOD_PATH/." "$container:$container_dest/"
+             docker cp "$mod_path/." "$container:$container_dest/"
         else
              # For remote, we copied contents to $target_mod_path.
              # We want to copy contents of $target_mod_path to $container_dest.
@@ -379,13 +393,9 @@ apply_mod_to_container() {
         exit 1
     fi
 
-    # 4. Signal completion
-    echo "  Signaling completion..."
-    $cmd_prefix docker exec "$container" touch /tmp/mod_done
-
-    # 5. Cleanup remote temp
+    # 4. Cleanup remote temp
     if [[ "$is_local" == "false" ]]; then
-        ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$node_ip" "rm -rf $target_mod_path"
+        ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$node_ip" "rm -rf $remote_cleanup_path"
     fi
 }
 
@@ -401,7 +411,7 @@ start_cluster() {
     echo "Starting Head Node on $HEAD_IP..."
     
     local head_cmd_args=()
-    if [[ -n "$MOD_PATH" ]]; then
+    if [[ ${#MOD_PATHS[@]} -gt 0 ]]; then
         head_cmd_args=(bash -c "echo Waiting for mod application...; while [ ! -f /tmp/mod_done ]; do sleep 1; done; echo Mod applied, starting node...; exec ./run-cluster-node.sh --role head --host-ip $HEAD_IP --eth-if $ETH_IF --ib-if $IB_IF")
     else
         head_cmd_args=(./run-cluster-node.sh --role head --host-ip "$HEAD_IP" --eth-if "$ETH_IF" --ib-if "$IB_IF")
@@ -420,7 +430,7 @@ start_cluster() {
         
         local docker_run_cmd="docker run -d --privileged --gpus all --rm --ipc=host --network host --name $CONTAINER_NAME $DOCKER_ARGS $IMAGE_NAME"
         
-        if [[ -n "$MOD_PATH" ]]; then
+        if [[ ${#MOD_PATHS[@]} -gt 0 ]]; then
             local inner_script="echo Waiting for mod application...; while [ ! -f /tmp/mod_done ]; do sleep 1; done; echo Mod applied, starting node...; exec ./run-cluster-node.sh --role node --host-ip $worker --eth-if $ETH_IF --ib-if $IB_IF --head-ip $HEAD_IP"
             ssh "$worker" "$docker_run_cmd bash -c \"$inner_script\""
         else
@@ -429,12 +439,23 @@ start_cluster() {
     done
 
     # Apply mods if requested
-    if [[ -n "$MOD_PATH" ]]; then
+    if [[ ${#MOD_PATHS[@]} -gt 0 ]]; then
         echo "Applying modifications to cluster nodes..."
-        apply_mod_to_container "$HEAD_IP" "$CONTAINER_NAME" "true"
         
+        # Apply to Head
+        for i in "${!MOD_PATHS[@]}"; do
+            apply_mod_to_container "$HEAD_IP" "$CONTAINER_NAME" "true" "${MOD_PATHS[$i]}" "${MOD_TYPES[$i]}"
+        done
+        # Signal completion on Head
+        docker exec "$CONTAINER_NAME" touch /tmp/mod_done
+        
+        # Apply to Workers
         for worker in "${PEER_NODES[@]}"; do
-            apply_mod_to_container "$worker" "$CONTAINER_NAME" "false"
+            for i in "${!MOD_PATHS[@]}"; do
+                apply_mod_to_container "$worker" "$CONTAINER_NAME" "false" "${MOD_PATHS[$i]}" "${MOD_TYPES[$i]}"
+            done
+            # Signal completion on Worker
+            ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker" "docker exec $CONTAINER_NAME touch /tmp/mod_done"
         done
     fi
 
