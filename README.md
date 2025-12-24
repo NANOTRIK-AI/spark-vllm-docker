@@ -15,9 +15,10 @@ While it was primarily developed to support multi-node inference, it works just 
 - [3. Running the Container (Manual)](#3-running-the-container-manual)
 - [4. Using `run-cluster-node.sh` (Internal)](#4-using-run-cluster-nodesh-internal)
 - [5. Configuration Details](#5-configuration-details)
-- [6. Using cluster mode for inference](#6-using-cluster-mode-for-inference)
-- [7. Fastsafetensors](#7-fastsafetensors)
-- [8. Benchmarking](#8-benchmarking)
+- [6. Mods and Patches](#6-mods-and-patches)
+- [7. Using cluster mode for inference](#7-using-cluster-mode-for-inference)
+- [8. Fastsafetensors](#8-fastsafetensors)
+- [9. Benchmarking](#9-benchmarking)
 
 ## DISCLAIMER
 
@@ -113,6 +114,31 @@ docker builder prune
 Don't do it every time you rebuild, because it will slow down compilation times.
 
 For periodic maintenance, I recommend using a filter: `docker builder prune --filter until=72h`
+
+### 2025-12-23
+
+- Added mods/patches functionality allowing custom patches to be applied via `--apply-mod` flag in `launch-cluster.sh`, enabling model-specific compatibility fixes and experimental features without rebuilding the entire image.
+
+- Added support for [Salyut1/GLM-4.7-NVFP4](https://huggingface.co/Salyut1/GLM-4.7-NVFP4) quant.
+
+To run, use the new `--apply-mod` flag to apply a patch that fixes incompatibility due to glm4 parser expecting separate k and v scales, while this model uses fused quantization scheme. See [this issue on Huggingface](https://huggingface.co/Salyut1/GLM-4.7-NVFP4/discussions/3#694ab9b6e2efa04b7ecb0c4b) for details.
+
+After downloading the model on both nodes (to avoid excessive wait times during launch), use this command:
+
+```bash
+./launch-cluster.sh --apply-mod ./mods/fix-Salyut1-GLM-4.7-NVFP4 \
+exec vllm serve Salyut1/GLM-4.7-NVFP4 \
+        --attention-config.backend flashinfer \
+        --tool-call-parser glm47 \
+        --reasoning-parser glm45 \
+        --enable-auto-tool-choice \
+        -tp 2 \
+        --gpu-memory-utilization 0.88 \
+        --max-model-len 32000 \
+        --distributed-executor-backend ray \
+        --host 0.0.0.0 \
+        --port 8000
+```
 
 ### 2025-12-21
 
@@ -403,6 +429,7 @@ You can override the auto-detected values if needed:
 | `--name` | Container name (default: `vllm_node`). |
 | `--eth-if` | Ethernet interface name. |
 | `--ib-if` | InfiniBand interface name. |
+| `--apply-mod` | Apply mods/patches from specified directory. Can be used multiple times to apply multiple mods. |
 | `--nccl-debug` | NCCL debug level (e.g., INFO, WARN). Defaults to INFO if flag is present but value is omitted. |
 | `--check-config` | Check configuration and auto-detection without launching. |
 | `-d` | Run in daemon mode (detached). |
@@ -536,7 +563,52 @@ docker exec -it vllm_node bash
 
 All environment variables (NCCL, Ray, vLLM config) set by the startup script will be loaded automatically in this new session.
 
-## 6\. Using cluster mode for inference
+## 6\. Mods and Patches
+
+The vLLM Docker setup supports applying custom mods and patches to address specific model compatibility issues or apply experimental features. This functionality is primarily managed through the `--apply-mod` option in the cluster launch script.
+
+### Available Mods
+
+The repository includes several pre-configured mods in the `mods/` directory:
+
+- **fix-Salyut1-GLM-4.7-NVFP4/**: Contains patches glm4moe parser to work with fused QKV quantization scheme for Salyut1/GLM-4.7-NVFP4 quant of the newly released GLM 4.7 model.
+
+Each mod directory typically contains:
+- Patch files (`.patch`) for code modifications and/or other assets.
+- `run.sh` script to apply the patch.
+
+Patch can also be represented as a `.zip` file with the same structure.
+
+### Using Mods
+
+To apply mods when launching the cluster, use the `--apply-mod` flag:
+
+```bash
+./launch-cluster.sh --apply-mod ./mods/fix-Salyut1-GLM-4.7-NVFP4
+```
+
+You can apply multiple mods by specifying additional `--apply-mod` flags:
+
+```bash
+./launch-cluster.sh --apply-mod ./mods/fix-Salyut1-GLM-4.7-NVFP4 --apply-mod ./mods/other-mod
+```
+
+### Creating Custom Mods
+
+To create your own mod:
+
+1. Create a new directory in the `mods/` folder
+2. Add your patch files (`.patch`) or other assets as necessary (optional).
+3. Create a `run.sh` script to apply the patch. It shouldn't accept any parameters. This script is required.
+4. Reference your mod using the `--apply-mod path/to/your/mod` flag
+
+Mods can be used for:
+- Applying specific model compatibility fixes
+- Testing experimental features
+- Customizing vLLM behavior for specific workloads
+- Rapid iteration on development without rebuilding the entire image
+
+## 7\. Using cluster mode for inference
 
 First, start follow the instructions above to start the head container on your first Spark, and node container on the second Spark.
 Then, on the first Spark, run vllm like this:
@@ -553,7 +625,7 @@ docker exec -it vllm_node
 
 And execute vllm command inside.
 
-## 7\. Fastsafetensors
+## 8\. Fastsafetensors
 
 This build includes support for fastsafetensors loading which significantly improves loading speeds, especially on DGX Spark where MMAP performance is very poor currently.
 [Fasttensors](https://github.com/foundation-model-stack/fastsafetensors/) solve this issue by using more efficient multi-threaded loading while avoiding mmap.
@@ -567,7 +639,7 @@ To use this method, simply include `--load-format fastsafetensors` when running 
 HF_HUB_OFFLINE=1 vllm serve openai/gpt-oss-120b --port 8888 --host 0.0.0.0 --trust_remote_code --swap-space 16 --gpu-memory-utilization 0.7 -tp 2 --distributed-executor-backend ray --load-format fastsafetensors
 ```
 
-## 8\. Benchmarking
+## 9\. Benchmarking
 
 Follow the guidance in [VLLM Benchmark Suites](https://docs.vllm.ai/en/latest/contributing/benchmarks/) to download benchmarking dataset, and then run a benchmark with a command like this (assuming you are running on head node, otherwise specify `--host` parameter):
 
