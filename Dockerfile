@@ -6,7 +6,7 @@ ARG BUILD_JOBS=16
 # =========================================================
 # STAGE 1: Base Image (Installs Dependencies)
 # =========================================================
-FROM nvidia/cuda:13.1.1-devel-ubuntu24.04 AS base
+FROM nvcr.io/nvidia/pytorch:26.01-py3 AS base
 
 # Build parallemism
 ARG BUILD_JOBS
@@ -36,9 +36,8 @@ ENV VLLM_BASE_DIR=/workspace/vllm
 RUN apt update && apt upgrade -y \
     && apt install -y --allow-change-held-packages --no-install-recommends \
     curl vim cmake build-essential ninja-build \
-    libcudnn9-cuda-13 libcudnn9-dev-cuda-13 \
-    python3-dev python3-pip git wget \
-    libnccl-dev libnccl2 libibverbs1 libibverbs-dev rdma-core \
+    git wget \
+    libibverbs1 libibverbs-dev rdma-core \
     ccache \
     && rm -rf /var/lib/apt/lists/* \
     && pip install uv
@@ -69,8 +68,9 @@ ARG CACHEBUST_DEPS=1
 # Using --mount=type=cache ensures that even if this layer invalidates, 
 # pip reuses previously downloaded wheels.
 
-RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-    uv pip install torch==2.9.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
+# PyTorch is pre-installed in the NGC image
+# RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
+#     uv pip install torch==2.9.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
 
 # Install additional dependencies
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
@@ -168,6 +168,8 @@ ARG PRE_TRANSFORMERS=0
 # Prepare build requirements
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     python3 use_existing_torch.py && \
+    sed -i 's/torch==2.9.1/torch>=2.10.0.dev0/g' requirements/cuda.txt && \
+    sed -i 's/torchaudio==2.9.1/torchaudio>=2.10.0.dev0/g' requirements/cuda.txt && \
     sed -i "/flashinfer/d" requirements/cuda.txt && \
     sed -i '/^triton\b/d' requirements/test.txt && \
     sed -i '/^fastsafetensors\b/d' requirements/test.txt && \
@@ -197,7 +199,7 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
 # =========================================================
 # STAGE 4: Runner (Transfers only necessary artifacts)
 # =========================================================
-FROM nvidia/cuda:13.1.1-devel-ubuntu24.04 AS runner
+FROM nvcr.io/nvidia/pytorch:26.01-py3 AS runner
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
@@ -214,9 +216,8 @@ ENV UV_LINK_MODE=copy
 # Note: "devel" tools like cmake/gcc are NOT installed here to save space
 RUN apt update && apt upgrade -y \
     && apt install -y --allow-change-held-packages --no-install-recommends \
-    python3 python3-pip python3-dev vim curl git wget \
-    libcudnn9-cuda-13 \
-    libnccl-dev libnccl2 libibverbs1 libibverbs-dev rdma-core \
+    vim curl git wget \
+    libibverbs1 libibverbs-dev rdma-core \
     libxcb1 \
     && rm -rf /var/lib/apt/lists/*
 
